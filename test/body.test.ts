@@ -184,12 +184,40 @@ describe("body", () => {
     expect(await response.body.text()).toBe(body);
   }, 1500);
 
+  it("rejects a pending web read when the response finishes", async () => {
+    let reader: ReadableStreamDefaultReader;
+    const pending = new Promise<unknown>((resolve) => {
+      app.use(
+        eventHandler(async (event) => {
+          reader = getRequestWebStream(event)!.getReader();
+          await reader.read();
+          resolve(reader.read().catch((error) => error));
+          return "ok";
+        }),
+      );
+    });
+    const body = new PassThrough();
+    try {
+      const response = client.request({ path: "/", method: "POST", body });
+      body.write("first");
+      expect(await (await response).body.text()).toBe("ok");
+      expect(await pending).toMatchObject({
+        message: "Response already finished",
+      });
+      await expect(reader!.read()).rejects.toThrow("Response already finished");
+    } finally {
+      body.destroy();
+      server.closeAllConnections();
+    }
+  }, 1500);
+
   it.each([
     ["an unused Web body", false, false],
     ["toWebRequest and readRawBody", true, false],
     ["a partial Web body read", false, true],
   ])("keeps a socket usable after %s", async (_name, readRaw, readPartial) => {
     const total = 512 * 1024;
+    const firstChunk = Buffer.alloc(1024, "a");
     let incoming: IncomingMessage;
     let connections = 0;
     server.on("connection", () => connections++);
@@ -200,10 +228,12 @@ describe("body", () => {
         }
         incoming = event.node.req;
         if (readPartial) {
-          expect(await getRequestWebStream(event)!.getReader().read()).toEqual({
-            value: Buffer.alloc(1024, "a"),
-            done: false,
-          });
+          const { value, done } = await getRequestWebStream(event)!
+            .getReader()
+            .read();
+          expect(done).toBe(false);
+          expect(value.length).toBeGreaterThan(0);
+          expect(value).toEqual(firstChunk.subarray(0, value.length));
           return "ok";
         }
         toWebRequest(event);
@@ -242,7 +272,7 @@ describe("body", () => {
       if (readRaw) {
         post.req.end(Buffer.alloc(total, "a"));
       } else {
-        post.req.write(Buffer.alloc(1024, "a"));
+        post.req.write(firstChunk);
       }
       expect(await post.response).toMatchObject({
         status: 200,

@@ -357,7 +357,10 @@ export function getRequestWebStream(
             }
           };
           const onFinish = () => {
-            cleanup!();
+            if (!closed) {
+              cleanup!();
+              controller.error(new Error("Response already finished"));
+            }
             req.resume();
           };
           cleanup = () => {
