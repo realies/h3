@@ -356,15 +356,21 @@ export function getRequestWebStream(
               controller.error(err);
             }
           };
+          const onFinish = () => {
+            cleanup!();
+            req.resume();
+          };
           cleanup = () => {
             closed = true;
             req.off("data", onData);
             req.off("end", onEnd);
             req.off("error", onError);
+            event.node.res?.off("finish", onFinish);
           };
           req.on("data", onData);
           req.on("end", onEnd);
           req.on("error", onError);
+          event.node.res?.once("finish", onFinish);
         }
         req.resume();
       },

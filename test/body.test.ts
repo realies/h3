@@ -185,9 +185,10 @@ describe("body", () => {
   }, 1500);
 
   it.each([
-    ["an unused Web body", false],
-    ["toWebRequest and readRawBody", true],
-  ])("keeps a socket usable after %s", async (_name, readRaw) => {
+    ["an unused Web body", false, false],
+    ["toWebRequest and readRawBody", true, false],
+    ["a partial Web body read", false, true],
+  ])("keeps a socket usable after %s", async (_name, readRaw, readPartial) => {
     const total = 512 * 1024;
     let incoming: IncomingMessage;
     let connections = 0;
@@ -198,6 +199,13 @@ describe("body", () => {
           return "ok";
         }
         incoming = event.node.req;
+        if (readPartial) {
+          expect(await getRequestWebStream(event)!.getReader().read()).toEqual({
+            value: Buffer.alloc(1024, "a"),
+            done: false,
+          });
+          return "ok";
+        }
         toWebRequest(event);
         if (readRaw) {
           return String((await readRawBody(event, false))?.length ?? 0);
