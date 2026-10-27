@@ -323,6 +323,17 @@ export function getRequestWebStream(
       pull(controller) {
         wantsData = true;
         if (!cleanup) {
+          if (req.errored) {
+            return controller.error(req.errored);
+          }
+          if (req.readableEnded) {
+            return controller.close();
+          }
+          if (req.destroyed) {
+            return controller.error(
+              Object.assign(new Error("aborted"), { code: "ECONNRESET" }),
+            );
+          }
           const onData = (chunk: Buffer) => {
             if (!closed) {
               wantsData = false;

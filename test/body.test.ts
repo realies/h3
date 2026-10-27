@@ -97,6 +97,93 @@ describe("body", () => {
     expect(await reader.read()).toEqual({ value: undefined, done: true });
   });
 
+  it("rejects after the client aborts before the first pull", async () => {
+    const result = new Promise<unknown>((resolve) => {
+      app.use(
+        eventHandler(async (event) => {
+          const body = getRequestWebStream(event)!;
+          await new Promise<void>((closed) => {
+            event.node.req.once("close", closed);
+          });
+          resolve(new Response(body).text().catch((error) => error));
+          return "ok";
+        }),
+      );
+    });
+    const received = once(server, "request");
+    const upload = request({
+      hostname: "localhost",
+      port: (server.address() as { port: number }).port,
+      method: "POST",
+    });
+    upload.on("error", () => {});
+    try {
+      upload.write("first");
+      const [incoming] = await received;
+      upload.socket!.destroy();
+      expect(await result).toBe(incoming.errored);
+      expect(incoming.errored).toMatchObject({
+        message: "aborted",
+        code: "ECONNRESET",
+      });
+    } finally {
+      upload.destroy();
+      server.closeAllConnections();
+    }
+  }, 1500);
+
+  it.each(["destroyed", "ended"])(
+    "settles a request already %s before the first pull",
+    async (state) => {
+      const req = new PassThrough();
+      const reader = getRequestWebStream({
+        method: "POST",
+        node: { req },
+      } as any)!.getReader();
+      const finished = once(req, state === "ended" ? "end" : "close");
+      if (state === "ended") {
+        req.end();
+        req.resume();
+      } else {
+        req.destroy();
+      }
+      await finished;
+      expect(req.errored).toBeNull();
+      if (state === "ended") {
+        expect(await reader.read()).toEqual({ value: undefined, done: true });
+      } else {
+        await expect(reader.read()).rejects.toMatchObject({
+          message: "aborted",
+          code: "ECONNRESET",
+        });
+      }
+    },
+    1500,
+  );
+
+  it("delivers a complete buffered upload before the first pull", async () => {
+    const body = "all buffered upload bytes";
+    app.use(
+      eventHandler(async (event) => {
+        const stream = getRequestWebStream(event)!;
+        const req = event.node.req;
+        await once(req, "readable");
+        await nextTurn();
+        expect(req.complete).toBe(true);
+        expect(req.readableEnded).toBe(false);
+        expect(req.readableLength).toBe(Buffer.byteLength(body));
+        return await new Response(stream).text();
+      }),
+    );
+    const response = await client.request({
+      path: "/",
+      method: "POST",
+      headers: { "content-length": String(Buffer.byteLength(body)) },
+      body,
+    });
+    expect(await response.body.text()).toBe(body);
+  }, 1500);
+
   it.each([
     ["an unused Web body", false],
     ["toWebRequest and readRawBody", true],
