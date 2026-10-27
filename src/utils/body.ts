@@ -315,16 +315,20 @@ export function getRequestWebStream(
 
   const req = event.node.req;
   let closed = false;
+  let wantsData = false;
   let cleanup: (() => void) | undefined;
 
   return new ReadableStream(
     {
       pull(controller) {
+        wantsData = true;
         if (!cleanup) {
           const onData = (chunk: Buffer) => {
             if (!closed) {
+              wantsData = false;
               controller.enqueue(chunk);
-              if (controller.desiredSize! <= 0) {
+              // Enqueue can synchronously pull again for another pending read.
+              if (!wantsData) {
                 req.pause();
               }
             }

@@ -83,6 +83,20 @@ describe("body", () => {
     expect(buffered.chunks).toBeLessThanOrEqual(2);
   });
 
+  it("fulfills two concurrent pending web reads", async () => {
+    const chunks = [Buffer.from("first"), Buffer.from("second")];
+    const req = Readable.from(chunks, { objectMode: false });
+    const reader = getRequestWebStream({
+      method: "POST",
+      node: { req },
+    } as any)!.getReader();
+
+    expect(await Promise.all([reader.read(), reader.read()])).toEqual(
+      chunks.map((value) => ({ value, done: false })),
+    );
+    expect(await reader.read()).toEqual({ value: undefined, done: true });
+  });
+
   it.each([
     ["an unused Web body", false],
     ["toWebRequest and readRawBody", true],
