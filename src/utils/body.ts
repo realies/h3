@@ -313,17 +313,42 @@ export function getRequestWebStream(
     });
   }
 
+  const req = event.node.req;
+  let closed = false;
+  let cleanup: () => void;
+
   return new ReadableStream({
     start: (controller) => {
-      event.node.req.on("data", (chunk) => {
-        controller.enqueue(chunk);
-      });
-      event.node.req.on("end", () => {
-        controller.close();
-      });
-      event.node.req.on("error", (err) => {
-        controller.error(err);
-      });
+      const onData = (chunk: Buffer) => {
+        if (!closed) {
+          controller.enqueue(chunk);
+        }
+      };
+      const onEnd = () => {
+        if (!closed) {
+          cleanup();
+          controller.close();
+        }
+      };
+      const onError = (err: Error) => {
+        if (!closed) {
+          cleanup();
+          controller.error(err);
+        }
+      };
+      cleanup = () => {
+        closed = true;
+        req.off("data", onData);
+        req.off("end", onEnd);
+        req.off("error", onError);
+      };
+      req.on("data", onData);
+      req.on("end", onEnd);
+      req.on("error", onError);
+    },
+    cancel() {
+      cleanup();
+      req.resume();
     },
   });
 }

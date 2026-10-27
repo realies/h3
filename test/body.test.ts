@@ -1,6 +1,7 @@
-import { Server } from "node:http";
+import { Server, type IncomingMessage } from "node:http";
 import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import getPort from "get-port";
 import { Client } from "undici";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -12,6 +13,8 @@ import {
   readBody,
   eventHandler,
   readMultipartFormData,
+  getRequestWebStream,
+  setResponseStatus,
 } from "../src";
 
 describe("body", () => {
@@ -30,6 +33,74 @@ describe("body", () => {
   afterEach(() => {
     client.close();
     server.close();
+  });
+
+  it.each([false, true])("cancels uploads (early: %s)", async (early) => {
+    const events = ["data", "end", "error"] as const;
+    let request: IncomingMessage;
+    let firstChunk: ReadableStreamReadResult<Buffer>;
+    let listenerCounts: number[];
+    let onCancelled: () => void;
+    let onFinished: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      onCancelled = resolve;
+    });
+    const finished = new Promise<void>((resolve) => {
+      onFinished = resolve;
+    });
+
+    app.use(
+      "/",
+      eventHandler(async (event) => {
+        request = event.node.req;
+        let chunks = 0;
+        request.on("data", () => {
+          if (chunks++ > 0) {
+            onFinished();
+          }
+        });
+        request.once("close", onFinished);
+        listenerCounts = events.map((name) => request.listenerCount(name));
+        const reader = getRequestWebStream(event)!.getReader();
+        firstChunk = await reader.read();
+        await reader.cancel(new Error("Stop reading"));
+        onCancelled();
+        if (!early) {
+          await finished;
+        }
+        expect(events.map((name) => request.listenerCount(name))).toEqual(
+          listenerCounts,
+        );
+        setResponseStatus(event, 413);
+        return "rejected";
+      }),
+    );
+
+    const body = new PassThrough();
+    const response = client.request({ path: "/", method: "POST", body }).then(
+      async (result) => ({
+        status: result.statusCode,
+        body: await result.body.text(),
+      }),
+      (error) => ({ error: error.code }),
+    );
+    const uncaughtErrors: Error[] = [];
+    const onUncaughtError = (error: Error) => uncaughtErrors.push(error);
+    process.on("uncaughtExceptionMonitor", onUncaughtError);
+    try {
+      body.write("first");
+      await cancelled;
+      if (!early) {
+        body.end("late");
+        await finished;
+      }
+      expect(await response).toEqual({ status: 413, body: "rejected" });
+      expect(firstChunk!.value).toEqual(Buffer.from("first"));
+      expect(uncaughtErrors).toEqual([]);
+    } finally {
+      process.off("uncaughtExceptionMonitor", onUncaughtError);
+      body.destroy();
+    }
   });
 
   describe("readRawBody", () => {
