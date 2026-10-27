@@ -1,7 +1,9 @@
-import { Server, type IncomingMessage } from "node:http";
+import { Agent, request, Server, type IncomingMessage } from "node:http";
+import { once } from "node:events";
 import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import getPort from "get-port";
 import { Client } from "undici";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -14,6 +16,7 @@ import {
   eventHandler,
   readMultipartFormData,
   getRequestWebStream,
+  toWebRequest,
   setResponseStatus,
 } from "../src";
 
@@ -35,51 +38,128 @@ describe("body", () => {
     server.close();
   });
 
-  it("backpressures a fast upload while the web stream is not read", async () => {
-    const body = Buffer.alloc(8 * 1024 * 1024, "a");
+  it("backpressures a fast upload while the web reader is stalled", async () => {
+    const chunk = Buffer.alloc(64 * 1024, "a");
+    const req = Readable.from(
+      Array.from({ length: 128 }, () => chunk),
+      {
+        objectMode: false,
+        highWaterMark: chunk.length,
+      },
+    );
+    let webBytes = 0;
+    let chunks = 0;
+    req.on("data", (data: Buffer) => {
+      webBytes += data.length;
+      chunks++;
+    });
+    const reader = getRequestWebStream({
+      method: "POST",
+      node: { req },
+    } as any)!.getReader();
+    const first = await reader.read();
+    // The in-memory source can finish this turn unless the bridge pauses it.
+    await nextTurn();
+    const buffered = {
+      webBytes: webBytes - first.value.length,
+      nodeBytes: req.readableLength,
+      highWaterMark: req.readableHighWaterMark,
+      chunks,
+    };
+    let bytes = first.value.length;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      bytes += value.length;
+    }
+    console.log("backpressure:", buffered);
+    expect(bytes).toBe(128 * chunk.length);
+    // At most one queued Web chunk plus Node's high water mark.
+    expect(buffered.webBytes + buffered.nodeBytes).toBeLessThanOrEqual(
+      2 * chunk.length,
+    );
+    expect(buffered.chunks).toBeLessThanOrEqual(2);
+  });
+
+  it.each([
+    ["an unused Web body", false],
+    ["toWebRequest and readRawBody", true],
+  ])("keeps a socket usable after %s", async (_name, readRaw) => {
+    const total = 512 * 1024;
+    let incoming: IncomingMessage;
+    let connections = 0;
+    server.on("connection", () => connections++);
     app.use(
-      "/",
       eventHandler(async (event) => {
-        const req = event.node.req;
-        let webBytes = 0;
-        let chunks = 0;
-        let maxChunk = 0;
-        req.on("data", (chunk: Buffer) => {
-          webBytes += chunk.length;
-          chunks++;
-          maxChunk = Math.max(maxChunk, chunk.length);
-        });
-        const reader = getRequestWebStream(event)!.getReader();
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        const buffered = {
-          webBytes,
-          nodeBytes: req.readableLength,
-          highWaterMark: req.readableHighWaterMark,
-          chunks,
-          maxChunk,
-        };
-        let bytes = 0;
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
-          }
-          bytes += value.length;
+        if (event.method === "GET") {
+          return "ok";
         }
-        return { bytes, buffered };
+        incoming = event.node.req;
+        toWebRequest(event);
+        if (readRaw) {
+          return String((await readRawBody(event, false))?.length ?? 0);
+        }
+        await once(incoming, "data");
+        return "ok";
       }),
     );
 
-    const response = await client.request({ path: "/", method: "POST", body });
-    const { bytes, buffered } = JSON.parse(await response.body.text());
-    console.log("backpressure:", { bodyBytes: body.length, ...buffered });
-    expect(bytes).toBe(body.length);
-    expect(buffered.webBytes).toBeGreaterThan(0);
-    // One Web chunk, plus Node's high water mark and at most one extra chunk.
-    expect(buffered.webBytes + buffered.nodeBytes).toBeLessThanOrEqual(
-      3 * Math.max(buffered.highWaterMark, buffered.maxChunk),
-    );
-    expect(buffered.chunks).toBe(1);
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+    const requests: ReturnType<typeof request>[] = [];
+    const send = (method: string, length?: number) => {
+      const req = request({
+        hostname: "localhost",
+        port: (server.address() as { port: number }).port,
+        method,
+        agent,
+        headers: length === undefined ? {} : { "content-length": length },
+      });
+      requests.push(req);
+      req.setTimeout(1500, () => req.destroy(new Error("Request timed out")));
+      const response = once(req, "response").then(async ([res]) => {
+        let body = "";
+        for await (const chunk of res) {
+          body += chunk;
+        }
+        return { status: res.statusCode, body, reused: req.reusedSocket };
+      });
+      return { req, response };
+    };
+
+    try {
+      const post = send("POST", total);
+      if (readRaw) {
+        post.req.end(Buffer.alloc(total, "a"));
+      } else {
+        post.req.write(Buffer.alloc(1024, "a"));
+      }
+      expect(await post.response).toMatchObject({
+        status: 200,
+        body: readRaw ? String(total) : "ok",
+      });
+      if (!readRaw) {
+        const finished = once(post.req, "finish");
+        post.req.end(Buffer.alloc(total - 1024, "a"));
+        await finished;
+      }
+      const next = send("GET");
+      next.req.end();
+      expect(await next.response).toEqual({
+        status: 200,
+        body: "ok",
+        reused: true,
+      });
+      expect(connections).toBe(1);
+      expect(incoming!.readableEnded).toBe(true);
+    } finally {
+      for (const req of requests) {
+        req.destroy();
+      }
+      agent.destroy();
+      server.closeAllConnections();
+    }
   });
 
   it.each([false, true])("cancels uploads (early: %s)", async (early) => {
@@ -100,12 +180,6 @@ describe("body", () => {
       "/",
       eventHandler(async (event) => {
         request = event.node.req;
-        let chunks = 0;
-        request.on("data", () => {
-          if (chunks++ > 0) {
-            onFinished();
-          }
-        });
         request.once("close", onFinished);
         listenerCounts = events.map((name) => request.listenerCount(name));
         const reader = getRequestWebStream(event)!.getReader();

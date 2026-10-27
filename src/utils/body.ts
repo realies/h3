@@ -315,49 +315,52 @@ export function getRequestWebStream(
 
   const req = event.node.req;
   let closed = false;
-  let cleanup: () => void;
+  let cleanup: (() => void) | undefined;
 
-  return new ReadableStream({
-    start: (controller) => {
-      req.pause();
-      const onData = (chunk: Buffer) => {
-        if (!closed) {
-          controller.enqueue(chunk);
-          if (controller.desiredSize! <= 0) {
-            req.pause();
-          }
+  return new ReadableStream(
+    {
+      pull(controller) {
+        if (!cleanup) {
+          const onData = (chunk: Buffer) => {
+            if (!closed) {
+              controller.enqueue(chunk);
+              if (controller.desiredSize! <= 0) {
+                req.pause();
+              }
+            }
+          };
+          const onEnd = () => {
+            if (!closed) {
+              cleanup!();
+              controller.close();
+            }
+          };
+          const onError = (err: Error) => {
+            if (!closed) {
+              cleanup!();
+              controller.error(err);
+            }
+          };
+          cleanup = () => {
+            closed = true;
+            req.off("data", onData);
+            req.off("end", onEnd);
+            req.off("error", onError);
+          };
+          req.on("data", onData);
+          req.on("end", onEnd);
+          req.on("error", onError);
         }
-      };
-      const onEnd = () => {
-        if (!closed) {
-          cleanup();
-          controller.close();
-        }
-      };
-      const onError = (err: Error) => {
-        if (!closed) {
-          cleanup();
-          controller.error(err);
-        }
-      };
-      cleanup = () => {
-        closed = true;
-        req.off("data", onData);
-        req.off("end", onEnd);
-        req.off("error", onError);
-      };
-      req.on("data", onData);
-      req.on("end", onEnd);
-      req.on("error", onError);
+        req.resume();
+      },
+      cancel() {
+        cleanup?.();
+        req.resume();
+      },
     },
-    pull() {
-      req.resume();
-    },
-    cancel() {
-      cleanup();
-      req.resume();
-    },
-  });
+    // Do not consume the Node request until the Web body is read.
+    { highWaterMark: 0 },
+  );
 }
 
 // --- Internal ---
