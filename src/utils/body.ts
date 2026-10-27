@@ -319,9 +319,13 @@ export function getRequestWebStream(
 
   return new ReadableStream({
     start: (controller) => {
+      req.pause();
       const onData = (chunk: Buffer) => {
         if (!closed) {
           controller.enqueue(chunk);
+          if (controller.desiredSize! <= 0) {
+            req.pause();
+          }
         }
       };
       const onEnd = () => {
@@ -345,6 +349,9 @@ export function getRequestWebStream(
       req.on("data", onData);
       req.on("end", onEnd);
       req.on("error", onError);
+    },
+    pull() {
+      req.resume();
     },
     cancel() {
       cleanup();

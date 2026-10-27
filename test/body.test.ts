@@ -35,6 +35,53 @@ describe("body", () => {
     server.close();
   });
 
+  it("backpressures a fast upload while the web stream is not read", async () => {
+    const body = Buffer.alloc(8 * 1024 * 1024, "a");
+    app.use(
+      "/",
+      eventHandler(async (event) => {
+        const req = event.node.req;
+        let webBytes = 0;
+        let chunks = 0;
+        let maxChunk = 0;
+        req.on("data", (chunk: Buffer) => {
+          webBytes += chunk.length;
+          chunks++;
+          maxChunk = Math.max(maxChunk, chunk.length);
+        });
+        const reader = getRequestWebStream(event)!.getReader();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const buffered = {
+          webBytes,
+          nodeBytes: req.readableLength,
+          highWaterMark: req.readableHighWaterMark,
+          chunks,
+          maxChunk,
+        };
+        let bytes = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          bytes += value.length;
+        }
+        return { bytes, buffered };
+      }),
+    );
+
+    const response = await client.request({ path: "/", method: "POST", body });
+    const { bytes, buffered } = JSON.parse(await response.body.text());
+    console.log("backpressure:", { bodyBytes: body.length, ...buffered });
+    expect(bytes).toBe(body.length);
+    expect(buffered.webBytes).toBeGreaterThan(0);
+    // One Web chunk, plus Node's high water mark and at most one extra chunk.
+    expect(buffered.webBytes + buffered.nodeBytes).toBeLessThanOrEqual(
+      3 * Math.max(buffered.highWaterMark, buffered.maxChunk),
+    );
+    expect(buffered.chunks).toBe(1);
+  });
+
   it.each([false, true])("cancels uploads (early: %s)", async (early) => {
     const events = ["data", "end", "error"] as const;
     let request: IncomingMessage;
