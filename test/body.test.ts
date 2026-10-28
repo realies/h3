@@ -211,6 +211,86 @@ describe("body", () => {
     }
   }, 1500);
 
+  it("rejects the first web read after an early response drains the upload", async () => {
+    let stream: ReadableStream;
+    let incoming: IncomingMessage;
+    app.use(
+      eventHandler((event) => {
+        incoming = event.node.req;
+        stream = getRequestWebStream(event)!;
+        return "ok";
+      }),
+    );
+    const upload = request({
+      hostname: "localhost",
+      port: (server.address() as { port: number }).port,
+      method: "POST",
+      headers: { "content-length": 9 },
+    });
+    upload.on("error", () => {});
+    try {
+      const response = once(upload, "response");
+      upload.write("first");
+      const [res] = await response;
+      let result = "";
+      for await (const chunk of res) {
+        result += chunk;
+      }
+      expect(result).toBe("ok");
+      expect(incoming!.complete).toBe(false);
+      const ended = once(incoming!, "end");
+      upload.end("late");
+      await ended;
+      expect(incoming!.readableEnded).toBe(true);
+      await expect(new Response(stream!).text()).rejects.toThrow(
+        "Response already finished",
+      );
+    } finally {
+      upload.destroy();
+      server.closeAllConnections();
+    }
+  }, 1500);
+
+  it("rejects a pending web read when the request closes without an error", async () => {
+    let incoming: IncomingMessage;
+    let pending: Promise<unknown>;
+    const reading = new Promise<void>((resolve) => {
+      app.use(
+        eventHandler(async (event) => {
+          incoming = event.node.req;
+          const reader = getRequestWebStream(event)!.getReader();
+          await reader.read();
+          pending = reader.read();
+          resolve();
+          await pending.catch(() => {});
+          return "ok";
+        }),
+      );
+    });
+    const upload = request({
+      hostname: "localhost",
+      port: (server.address() as { port: number }).port,
+      method: "POST",
+    });
+    upload.on("error", () => {});
+    try {
+      upload.write("first");
+      await reading;
+      const closed = once(incoming!, "close");
+      incoming!.destroy();
+      await closed;
+      expect(incoming!.readableEnded).toBe(false);
+      expect(incoming!.errored).toBeNull();
+      await expect(pending!).rejects.toMatchObject({
+        message: "aborted",
+        code: "ECONNRESET",
+      });
+    } finally {
+      upload.destroy();
+      server.closeAllConnections();
+    }
+  }, 1500);
+
   it.each([
     ["an unused Web body", false, false],
     ["toWebRequest and readRawBody", true, false],
